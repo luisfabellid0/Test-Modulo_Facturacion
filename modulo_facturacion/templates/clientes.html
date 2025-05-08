@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block content %}
+    <h2>Lista de Clientes</h2>
+    <a href="{{ url_for('agregar_cliente') }}" class="btn">Agregar Cliente Nuevo</a>
+
+    {% if error %}
+        <div class="error">{{ error }}</div>
+    {% endif %}
+
+    <table>
+        <thead>
+            <tr>
+                <th>Nombre</th>
+                <th>Dirección</th>
+                <th>Teléfono</th>
+                <th>Email</th>
+                <th>Acciones</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for cliente in clientes %}
+            <tr>
+                <td>{{ cliente[1] }}</td>
+                <td>{{ cliente[2] }}</td>
+                <td>{{ cliente[3] }}</td>
+                <td>{{ cliente[4] }}</td>
+                <td>
+                    <!-- Modificar cliente -->
+                    <a href="{{ url_for('editar_cliente', id=cliente[0]) }}" class="btn">Modificar</a>
+                    
+                    <!-- Formulario para eliminar cliente con método POST -->
+                    <form action="{{ url_for('eliminar_cliente', id=cliente[0]) }}" method="POST" style="display: inline-block;">
+                        <button type="submit" 
+                                class="btn" 
+                                style="padding: 0.75rem 1.5rem; font-size: 1rem;" 
+                                onclick="return confirm('¿Estás seguro de eliminar este cliente?')">
+                            Eliminar
+                        </button>
+                    </form>
+                </td>
+                
+                
+                
+                
+                
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}

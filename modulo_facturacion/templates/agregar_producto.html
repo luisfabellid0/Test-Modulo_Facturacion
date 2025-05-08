@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+
+{% block content %}
+    <header style="background: none; color: black;">
+        <h1>Agregar Producto</h1>
+    </header>
+
+    <main>
+        {% if error %}
+            <p style="color: red; text-align: center; font-weight: bold;">{{ error }}</p>
+        {% endif %}
+        <form action="{{ url_for('agregar_producto') }}" method="POST" style="max-width: 600px; margin: 0 auto; padding: 2rem; background-color: #f4f4f4; border-radius: 8px;">
+            
+            <!-- Nombre -->
+            <div class="form-group">
+                <label for="nombre">Nombre:</label>
+                <input type="text" id="nombre" name="nombre" required class="input-field">
+            </div>
+
+            <!-- Descripción -->
+            <div class="form-group">
+                <label for="descripcion">Descripción:</label>
+                <textarea id="descripcion" name="descripcion" required style="width: 90%; height: 100px; padding: 15px; font-size: 1.1rem; margin-bottom: 1rem; border-radius: 5px; border: 1px solid #ccc;"></textarea>
+            </div>
+
+            <!-- Precio -->
+            <div class="form-group">
+                <label for="precio">Precio:</label>
+                <input type="number" id="precio" name="precio" step="0.01" min="0" required class="input-field">
+            </div>
+
+            <!-- Botón de Envío -->
+            <div class="form-group" style="display: flex; gap: 10px;">
+                <button type="submit" class="btn" style="flex: 1; font-size: 1rem;">Agregar Producto</button>
+                <a href="{{ url_for('listar_productos') }}" class="btn" style="flex: 1; text-align: center;">Cancelar</a>
+            </div>
+            
+        </form>
+    </main>
+{% endblock %}
