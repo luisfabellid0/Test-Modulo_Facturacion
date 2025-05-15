@@ -3913,3 +3913,1491 @@ def test_sequence_factura_numero_seq_is_dropped_and_recreated_as_defined(mock_db
 
     mock_cursor.execute.assert_any_call(drop_sequence_cmd)
     mock_cursor.execute.assert_any_call(create_sequence_cmd)
+# --- 10 Tests Adicionales Nuevos ---
+
+def test_create_tables_db_config_host_as_int_type_error(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: DB_CONFIG tiene 'host' como un entero, psycopg2.connect debería fallar con TypeError."""
+    # Configurar DB_CONFIG con un tipo inválido para 'host'
+    faulty_db_config = init_db.DB_CONFIG.copy()
+    faulty_db_config['host'] = 12345  # host como entero
+    monkeypatch.setattr(init_db, 'DB_CONFIG', faulty_db_config)
+
+    # Simular el error que psycopg2.connect podría lanzar (TypeError por **kwargs)
+    mock_db["connect"].side_effect = TypeError("keyword arguments must be strings")
+
+    init_db.create_tables()
+
+    # Se intenta conectar con la configuración defectuosa
+    # La aserción exacta de cómo se llama a connect con un host entero es complicada,
+    # ya que el error de TypeError ocurre durante el desempaquetado de kwargs.
+    # Lo importante es que se intentó y falló como se esperaba.
+    assert mock_db["connect"].called # Al menos se intentó llamar
+    mock_db["conn"].cursor.assert_not_called()
+    mock_insert_test_data_fixture.assert_not_called()
+    mock_db["conn"].close.assert_not_called()
+    captured = capsys.readouterr()
+    assert "Error al crear tablas: keyword arguments must be strings" in captured.out
+
+
+def test_create_tables_cursor_context_exit_fails_after_successful_execute(mock_db, mock_insert_test_data_fixture, capsys):
+    """FAIL Test: El __exit__ del context manager del cursor falla después de ejecuciones SQL exitosas."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+
+    # Simular que __exit__ del cursor falla.
+    # Esto ocurriría después de que todos los comandos en el bloque 'with cur:' se hayan ejecutado.
+    mock_conn.cursor.return_value.__exit__.side_effect = DatabaseError("Fallo simulado en cursor.__exit__")
+    # Asegurar que el __exit__ no suprime la excepción
+    mock_conn.cursor.return_value.__exit__.return_value = False # No suprimir la excepción
+
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**mock_db["db_config"])
+    mock_conn.cursor.assert_called_once()
+    mock_conn.cursor.return_value.__enter__.assert_called_once() # Se entró al contexto
+
+    # Todos los DROPs y CREATEs se intentaron
+    assert mock_cursor.execute.call_count == 5 + len(init_db.commands)
+    # insert_test_data también se intentó, ya que el error es al salir del cursor
+    mock_insert_test_data_fixture.assert_called_once_with(mock_cursor)
+    # Los commits también se intentaron antes del error en __exit__
+    assert mock_conn.commit.call_count == 2
+
+    mock_conn.cursor.return_value.__exit__.assert_called_once() # Se intentó salir del contexto
+
+    mock_conn.rollback.assert_called_once() # Se espera rollback debido al error en __exit__
+    mock_conn.close.assert_called_once()    # La conexión se cierra en el finally de create_tables
+    captured = capsys.readouterr()
+    assert "Error al crear tablas: Fallo simulado en cursor.__exit__" in captured.out
+    assert "Tablas creadas y datos de prueba insertados correctamente." not in captured.out
+
+
+def test_create_tables_conn_rollback_itself_fails_after_prior_error(mock_db, capsys):
+    """FAIL Test: conn.rollback() falla después de un error previo que activó el rollback."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+
+    # Simular un error inicial durante la ejecución de un comando DROP
+    initial_error = ProgrammingError("Error SQL inicial en DROP")
+    mock_cursor.execute.side_effect = initial_error
+
+    # Simular que conn.rollback() también falla
+    rollback_error = DatabaseError("Fallo simulado en conn.rollback()")
+    mock_conn.rollback.side_effect = rollback_error
+
+    # monkeypatch.setattr('init_db.insert_test_data', mock.MagicMock()) # Asegurar que no interfiere
+
+    # Como rollback() falla, la excepción original (initial_error) podría ser opacada
+    # o ambas podrían ser reportadas dependiendo de cómo esté implementado el except en init_db.py.
+    # El script de prueba original imprime el error de la excepción capturada.
+    # Si el error de rollback es el último en ocurrir dentro del except, ese se reportará.
+    # Sin embargo, el finally todavía intentará cerrar la conexión.
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once()
+    mock_conn.cursor.assert_called_once()
+    mock_cursor.execute.assert_called_once() # El primer execute falla
+
+    mock_conn.commit.assert_not_called()
+    mock_conn.rollback.assert_called_once() # Se intentó el rollback
+
+    mock_conn.close.assert_called_once() # El finally debe cerrar la conexión
+
+    captured = capsys.readouterr()
+    # El mensaje de error dependerá de cómo init_db.py maneja excepciones anidadas.
+    # Generalmente, la excepción original podría perderse si no se maneja explícitamente.
+    # Si el print(f"Error al crear tablas: {e}") simplemente imprime la última excepción, será rollback_error.
+    # Si init_db.py es `except db_err: try: conn.rollback() except: pass; print(db_err)`, se imprimiría initial_error.
+    # Asumamos que el `print` en `except` captura la excepción actual en ese scope.
+    # Si `rollback` falla y la excepción no es capturada y manejada *dentro* del `except` de `create_tables`,
+    # la excepción de `rollback` se propagará.
+    # El `print(f"Error al crear tablas: {e}")` en el `except psycopg2.Error as e:`
+    # imprimirá el error que causó la entrada al bloque `except`. Si `rollback` falla después,
+    # esa nueva excepción de `rollback` podría no ser la que se imprime con ese `print`.
+    # Sin embargo, si la falla de rollback no es atrapada por otro try-except dentro del except original,
+    # se propagará y pytest la detectará.
+    # La prueba actual espera que el mensaje de error venga del bloque `except psycopg2.Error` o `except Exception`.
+    # Si `rollback` falla, el error que se imprime es el `initial_error` porque el error de `rollback`
+    # ocurre *después* de que `initial_error` haya sido asignado a `e`.
+    assert "Error al crear tablas: Error SQL inicial en DROP" in captured.out
+    # Y la excepción de rollback se propagaría fuera de create_tables si no hay más manejo.
+    # Para este test, nos enfocamos en lo que create_tables *imprime*.
+
+
+def test_insert_test_data_clientes_list_contains_none_value(mock_db, monkeypatch):
+    """FAIL Test: init_db.clientes contiene un valor None, causando error en insert_test_data."""
+    mock_cursor = mock_db["cursor"]
+    mock_cursor.fetchone.return_value = (0,) # Para intentar inserts
+
+    malformed_clientes_list = [
+        ("Cliente Uno", "Calle 123", "555-1234", "cliente1@example.com"),
+        None, # Entrada None
+        ("Cliente Tres", "Avenida XYZ", "555-5678", "cliente3@example.com")
+    ]
+    monkeypatch.setattr(init_db, 'clientes', malformed_clientes_list)
+    monkeypatch.setattr(init_db, 'productos', []) # No testear productos aquí
+
+    # Se espera un TypeError cuando se intente desempaquetar o usar el None como tupla de datos para SQL.
+    with pytest.raises(TypeError) as excinfo:
+        init_db.insert_test_data(mock_cursor)
+
+    # Verificar que el error es por el None (puede ser 'NoneType' no es iterable o similar)
+    # El mensaje exacto puede variar, ej. "can't format NoneType for SQL" o error de desempaquetado.
+    assert "NoneType" in str(excinfo.value) or "'NoneType' object is not iterable" in str(excinfo.value)
+
+    mock_cursor.execute.assert_any_call("SELECT COUNT(*) FROM clientes;")
+    # Se intentó el insert para el primer cliente válido
+    mock_cursor.execute.assert_any_call(
+        "INSERT INTO clientes (nombre, direccion, telefono, email) VALUES (%s, %s, %s, %s);",
+        malformed_clientes_list[0]
+    )
+    # El insert para el None no se llega a completar o falla durante la preparación del 'execute'.
+
+
+def test_create_tables_commands_tuple_contains_none_sql_value(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: init_db.commands contiene un valor None como comando SQL."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+
+    # Modificar init_db.commands para incluir un None
+    original_commands = list(init_db.commands)
+    if not original_commands: # Asegurar que hay comandos para modificar
+        original_commands.append("CREATE TABLE dummy_before (id int);") # Añadir uno si está vacío
+    
+    faulty_commands = tuple(original_commands[:1] + [None] + original_commands[1:])
+    monkeypatch.setattr(init_db, 'commands', faulty_commands)
+    
+    # psycopg2 cur.execute(None) probablemente lance un TypeError o ProgrammingError
+    # Simularemos que la segunda llamada a execute (la que tiene None) falla.
+    # La primera llamada (un CREATE TABLE válido) debería pasar.
+    # La primera tanda de 5 drops y su commit también deberían pasar.
+    
+    expected_error_msg = "query argument must be a string" # Mensaje típico de psycopg2 para execute(None)
+    
+    call_count_at_failure = 0
+    def side_effect_execute_for_none_command(command, *args, **kwargs):
+        nonlocal call_count_at_failure
+        call_count_at_failure +=1
+        # El None estará después de los 5 drops y el primer comando válido de 'faulty_commands'
+        if call_count_at_failure == (5 + 1 + 1) and command is None:
+            raise TypeError(expected_error_msg) # O ProgrammingError
+        # Permitir que otras llamadas (drops, primer create) pasen si no se especifica un original_execute
+        elif command is None and call_count_at_failure != (5+1+1): # Asegurar que no es un None inesperado
+             raise ValueError("None command encountered at unexpected call count")
+        return mock.DEFAULT # Para las llamadas válidas
+
+    mock_cursor.execute.side_effect = side_effect_execute_for_none_command
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once()
+    mock_conn.cursor.assert_called_once()
+    
+    # Se ejecutaron 5 drops, 1 commit, 1 create válido, y luego el intento de ejecutar None
+    assert mock_cursor.execute.call_count == 5 + 1 + 1
+    mock_insert_test_data_fixture.assert_not_called()
+    assert mock_conn.commit.call_count == 1 # Solo el commit después de los drops
+    mock_conn.rollback.assert_called_once()
+    mock_conn.close.assert_called_once()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {expected_error_msg}" in captured.out
+
+
+def test_create_tables_commands_tuple_contains_empty_sql_string(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: init_db.commands contiene una cadena vacía como comando SQL."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+
+    original_commands = list(init_db.commands)
+    if not original_commands:
+        original_commands.append("CREATE TABLE dummy_before (id int);")
+        
+    faulty_commands = tuple(original_commands[:1] + [""] + original_commands[1:])
+    monkeypatch.setattr(init_db, 'commands', faulty_commands)
+
+    expected_error_msg = "cannot execute an empty query" # Mensaje de psycopg2
+    
+    call_count_at_failure = 0
+    def side_effect_execute_for_empty_command(command, *args, **kwargs):
+        nonlocal call_count_at_failure
+        call_count_at_failure+=1
+        if call_count_at_failure == (5 + 1 + 1) and command == "":
+            raise psycopg2.ProgrammingError(expected_error_msg)
+        return mock.DEFAULT
+
+    mock_cursor.execute.side_effect = side_effect_execute_for_empty_command
+    
+    init_db.create_tables()
+
+    assert mock_cursor.execute.call_count == 5 + 1 + 1
+    mock_insert_test_data_fixture.assert_not_called()
+    assert mock_conn.commit.call_count == 1 # Solo el commit después de los drops
+    mock_conn.rollback.assert_called_once()
+    mock_conn.close.assert_called_once()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {expected_error_msg}" in captured.out
+
+
+def test_create_tables_db_config_with_extra_unrecognized_keys_success(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """SUCCESS Test: DB_CONFIG con claves extra no reconocidas; psycopg2.connect debería ignorarlas."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+
+    # DB_CONFIG con una clave extra benigna
+    extended_db_config = init_db.DB_CONFIG.copy()
+    extended_db_config["my_custom_app_param"] = "some_value"
+    # Importante: monkeypatch el DB_CONFIG en el módulo init_db, no solo el mock_db["db_config"]
+    monkeypatch.setattr(init_db, 'DB_CONFIG', extended_db_config)
+    
+    # Para este test, necesitamos que el connect original sea llamado pero con el extended_db_config.
+    # La fixture mock_db ya tiene un mock_connect.
+    # Necesitamos que mock_db["connect"] sea llamado con extended_db_config
+    # y que no falle por la clave extra. psycopg2 ignora claves extra.
+
+    init_db.create_tables() # Debería funcionar normalmente
+
+    # Verificar que connect fue llamado con la config extendida
+    mock_db["connect"].assert_called_once_with(**extended_db_config)
+    
+    # Verificar flujo de éxito completo
+    assert mock_cursor.execute.call_count == 5 + len(init_db.commands) # init_db.commands ahora referirá a la versión original si no se monkeypatchea globalmente
+    mock_insert_test_data_fixture.assert_called_once_with(mock_cursor)
+    assert mock_conn.commit.call_count == 2
+    mock_conn.rollback.assert_not_called()
+    mock_conn.close.assert_called_once()
+    captured = capsys.readouterr()
+    assert "Tablas creadas y datos de prueba insertados correctamente." in captured.out
+
+
+def test_create_tables_operational_error_during_table_creation_execute(mock_db, mock_insert_test_data_fixture, capsys):
+    """FAIL Test: OperationalError (ej. servidor desconectado) durante execute() de un CREATE TABLE."""
+    mock_cursor = mock_db["cursor"]
+    mock_conn = mock_db["conn"]
+
+    operational_err_msg = "server closed the connection unexpectedly"
+    # Fallar en el primer comando CREATE (después de 5 drops y su commit)
+    fail_on_call_nth = 6 
+    original_execute = mock_cursor.execute # Guardar el original por si acaso
+    
+    def side_effect_execute_operational_err(command, *args, **kwargs):
+        if mock_cursor.execute.call_count == fail_on_call_nth and "CREATE" in command:
+            raise psycopg2.OperationalError(operational_err_msg)
+        # Si se usa original_execute, se necesita asegurar que no cause recursión infinita.
+        # Usar mock.DEFAULT es más seguro si el mock ya está configurado para un comportamiento por defecto.
+        return mock.DEFAULT 
+
+    mock_cursor.execute.side_effect = side_effect_execute_operational_err
+    
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once()
+    mock_conn.cursor.assert_called_once()
+    assert mock_cursor.execute.call_count == fail_on_call_nth # Se llamó hasta el fallo
+    
+    mock_insert_test_data_fixture.assert_not_called()
+    assert mock_conn.commit.call_count == 1 # El commit de los drops
+    mock_conn.rollback.assert_called_once()
+    mock_conn.close.assert_called_once()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {operational_err_msg}" in captured.out
+
+
+def test_insert_test_data_fetchone_returns_direct_int_for_count(mock_db, monkeypatch):
+    """FAIL Test: insert_test_data si fetchone() para el conteo retorna un entero directamente (no una tupla)."""
+    mock_cursor = mock_db["cursor"]
+    # Simular que fetchone() retorna un entero directamente, ej. 0, en lugar de (0,)
+    mock_cursor.fetchone.return_value = 0 
+
+    # Esto debería causar un TypeError en `count_result[0]` porque un int no es subscriptable.
+    with pytest.raises(TypeError) as excinfo:
+        init_db.insert_test_data(mock_cursor)
+    
+    assert "'int' object is not subscriptable" in str(excinfo.value)
+    mock_cursor.execute.assert_called_once_with("SELECT COUNT(*) FROM clientes;")
+    mock_cursor.fetchone.assert_called_once()
+
+
+def test_create_tables_db_config_with_non_string_dict_key_type_error(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: DB_CONFIG tiene una clave que no es string, causando TypeError en connect."""
+    
+    # Configurar DB_CONFIG con una clave no-string
+    faulty_db_config = init_db.DB_CONFIG.copy()
+    faulty_db_config[12345] = "some_value" # Clave entera
+    # No es necesario eliminar una clave válida si el error ocurre por la clave inválida.
+    monkeypatch.setattr(init_db, 'DB_CONFIG', faulty_db_config)
+
+    # psycopg2.connect(**kwargs) espera que todas las kwargs sean strings.
+    mock_db["connect"].side_effect = TypeError("keywords must be strings")
+
+    init_db.create_tables()
+
+    # La llamada a connect fallará durante el desempaquetado de kwargs.
+    # La aserción de cómo fue llamado es difícil, pero debe haber sido llamado.
+    assert mock_db["connect"].called 
+    mock_db["conn"].cursor.assert_not_called()
+    mock_insert_test_data_fixture.assert_not_called()
+    mock_db["conn"].close.assert_not_called() # conn sería None o no se asignaría
+    captured = capsys.readouterr()
+    assert "Error al crear tablas: keywords must be strings" in captured.out
+# --- Otros 10 Tests Adicionales Nuevos ---
+
+def test_create_tables_db_config_host_none_value(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: DB_CONFIG tiene 'host' como None, causando un error en psycopg2.connect."""
+    faulty_db_config = init_db.DB_CONFIG.copy()
+    faulty_db_config['host'] = None  # host es None
+    monkeypatch.setattr(init_db, 'DB_CONFIG', faulty_db_config)
+
+    # psycopg2.connect(host=None) podría resultar en "ValueError: host argument must not be None" o similar.
+    # O podría intentar conectarse al host por defecto si None es interpretado como "no especificado".
+    # Simularemos un error específico que indique que el host es inválido o no se puede resolver.
+    # Por ejemplo, si intenta usar "None" como un nombre de host.
+    mock_db["connect"].side_effect = psycopg2.OperationalError("could not translate host name \"None\" to address: Unknown host")
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**faulty_db_config)
+    mock_db["conn"].cursor.assert_not_called()
+    mock_insert_test_data_fixture.assert_not_called()
+    captured = capsys.readouterr()
+    assert "Error al crear tablas: could not translate host name \"None\" to address: Unknown host" in captured.out
+
+
+def test_insert_test_data_violates_db_check_constraint(mock_db, monkeypatch):
+    """FAIL Test: Un insert intenta violar un CHECK constraint de la BD (simulado)."""
+    mock_cursor = mock_db["cursor"]
+    mock_cursor.fetchone.return_value = (0,) # Para intentar inserts
+
+    # Asumamos que productos.precio tiene un CHECK constraint (precio > 0)
+    # y los datos de init_db.py lo respetan, pero aquí lo modificamos para fallar.
+    faulty_productos = [("ProductoCero", "Descripción Cero", 0.00)] # Precio no > 0
+    monkeypatch.setattr(init_db, 'productos', faulty_productos)
+    monkeypatch.setattr(init_db, 'clientes', []) # Para aislar
+
+    error_msg = 'new row for relation "productos" violates check constraint "productos_precio_check"'
+    def side_effect_execute(command, data_tuple=None):
+        if "INSERT INTO productos" in command and data_tuple[2] <= 0: # data_tuple[2] es el precio
+            raise psycopg2.IntegrityError(error_msg)
+        return mock.DEFAULT
+    mock_cursor.execute.side_effect = side_effect_execute
+
+    with pytest.raises(psycopg2.IntegrityError, match=error_msg):
+        init_db.insert_test_data(mock_cursor)
+
+    mock_cursor.execute.assert_any_call("SELECT COUNT(*) FROM clientes;")
+    mock_cursor.execute.assert_any_call(
+        "INSERT INTO productos (nombre, descripcion, precio) VALUES (%s, %s, %s);",
+        faulty_productos[0]
+    )
+
+
+def test_create_tables_init_db_commands_is_none(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: init_db.commands es None, causando TypeError al iterar."""
+    mock_conn = mock_db["conn"]
+    monkeypatch.setattr(init_db, 'commands', None) # commands es None
+
+    init_db.create_tables() # Debería causar TypeError: 'NoneType' object is not iterable
+
+    mock_db["connect"].assert_called_once()
+    mock_conn.cursor.assert_called_once()
+    # Se ejecutan los 5 drops y su commit antes de intentar iterar init_db.commands
+    assert mock_db["cursor"].execute.call_count == 5
+    assert mock_conn.commit.call_count == 1 # Commit después de los drops
+    mock_insert_test_data_fixture.assert_not_called() # No se llega a los inserts
+    mock_conn.rollback.assert_called_once()
+    mock_conn.close.assert_called_once()
+    captured = capsys.readouterr()
+    assert "Error al crear tablas:" in captured.out
+    assert "'NoneType' object is not iterable" in captured.out
+
+
+def test_create_tables_init_db_clientes_is_none_in_insert_test_data(mock_db, monkeypatch, capsys):
+    """FAIL Test: init_db.clientes es None, causando error en insert_test_data."""
+    mock_cursor = mock_db["cursor"]
+    mock_conn = mock_db["conn"]
+    mock_cursor.fetchone.return_value = (0,) # Para que insert_test_data proceda
+
+    monkeypatch.setattr(init_db, 'clientes', None) # clientes es None
+    # No usamos mock_insert_test_data_fixture para que se llame el real
+
+    # El error ocurrirá dentro de insert_test_data al intentar `for cliente_data in clientes:`
+    # Esto será capturado por el try-except general de create_tables.
+
+    init_db.create_tables()
+
+    # create_tables debería progresar hasta llamar a insert_test_data
+    # Todos los drops y creates deberían completarse, y el primer commit.
+    assert mock_cursor.execute.call_count == 5 + len(init_db.commands) # Asumiendo que init_db.commands es el original
+    assert mock_conn.commit.call_count == 1 # El commit después de los drops y creates
+
+    # El segundo commit no ocurre porque insert_test_data falla antes.
+    mock_conn.rollback.assert_called_once()
+    mock_conn.close.assert_called_once()
+    captured = capsys.readouterr()
+    assert "Error al crear tablas:" in captured.out
+    assert "'NoneType' object is not iterable" in captured.out # Error de insert_test_data
+
+
+def test_create_tables_permission_denied_for_drop_sequence(mock_db, mock_insert_test_data_fixture, capsys):
+    """FAIL Test: Permiso denegado al ejecutar DROP SEQUENCE."""
+    mock_cursor = mock_db["cursor"]
+    mock_conn = mock_db["conn"]
+    error_msg = "permission denied for sequence factura_numero_seq"
+
+    def side_effect_execute(command, *args, **kwargs):
+        if "DROP SEQUENCE IF EXISTS factura_numero_seq" in command:
+            raise psycopg2.ProgrammingError(error_msg)
+        return mock.DEFAULT
+    mock_cursor.execute.side_effect = side_effect_execute
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once()
+    mock_conn.cursor.assert_called_once()
+    # Los drops de tablas se ejecutan antes que el drop de secuencia
+    # Debería haber al menos 4 llamadas a execute para los drops de tablas antes de fallar.
+    assert mock_cursor.execute.call_count >= 4
+    mock_cursor.execute.assert_any_call("DROP SEQUENCE IF EXISTS factura_numero_seq")
+
+    mock_insert_test_data_fixture.assert_not_called()
+    mock_conn.commit.assert_not_called() # El primer commit (post-drops) no se alcanza
+    mock_conn.rollback.assert_called_once()
+    mock_conn.close.assert_called_once()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+
+
+def test_create_tables_db_config_invalid_options_string(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: DB_CONFIG tiene una cadena 'options' malformada o con opciones inválidas."""
+    faulty_db_config = init_db.DB_CONFIG.copy()
+    # Esta opción es inválida para PostgreSQL y causará error al conectar.
+    faulty_db_config['options'] = '-c client_encoding=nonexistent_encoding_for_error'
+    monkeypatch.setattr(init_db, 'DB_CONFIG', faulty_db_config)
+
+    error_msg = 'invalid value for parameter "client_encoding": "nonexistent_encoding_for_error"'
+    mock_db["connect"].side_effect = psycopg2.OperationalError(error_msg)
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**faulty_db_config)
+    mock_insert_test_data_fixture.assert_not_called()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+
+
+def test_create_tables_internal_error_on_execute_drop(mock_db, mock_insert_test_data_fixture, capsys):
+    """FAIL Test: psycopg2.InternalError durante la ejecución de un comando DROP."""
+    mock_cursor = mock_db["cursor"]
+    mock_conn = mock_db["conn"]
+    error_msg = "simulated internal server error during DROP"
+
+    # Fallar en el primer comando DROP
+    mock_cursor.execute.side_effect = psycopg2.InternalError(error_msg)
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once()
+    mock_conn.cursor.assert_called_once()
+    mock_cursor.execute.assert_called_once() # Falla en el primer execute
+
+    mock_insert_test_data_fixture.assert_not_called()
+    mock_conn.commit.assert_not_called()
+    mock_conn.rollback.assert_called_once()
+    mock_conn.close.assert_called_once()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+
+
+def test_create_tables_not_supported_error_on_connect(mock_db, mock_insert_test_data_fixture, capsys):
+    """FAIL Test: psycopg2.connect levanta NotSupportedError (ej. método de autenticación no soportado)."""
+    error_msg = "authentication method not supported"
+    mock_db["connect"].side_effect = psycopg2.NotSupportedError(error_msg)
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**mock_db["db_config"])
+    mock_db["conn"].cursor.assert_not_called()
+    mock_insert_test_data_fixture.assert_not_called()
+    mock_db["conn"].close.assert_not_called()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+
+
+def test_insert_test_data_data_error_value_too_long_for_cliente_nombre(mock_db, monkeypatch):
+    """FAIL Test: DataError específico por valor demasiado largo para clientes.nombre."""
+    mock_cursor = mock_db["cursor"]
+    mock_cursor.fetchone.return_value = (0,) # Para intentar inserts
+
+    # Asumimos que clientes.nombre es VARCHAR(100)
+    long_name = "X" * 101
+    faulty_clientes = [(long_name, "Direccion", "Telefono", "email@example.com")]
+    monkeypatch.setattr(init_db, 'clientes', faulty_clientes)
+    monkeypatch.setattr(init_db, 'productos', [])
+
+    error_msg = f'value too long for type character varying(100)'
+    def side_effect_execute(command, data_tuple=None):
+        if "INSERT INTO clientes" in command and data_tuple[0] == long_name:
+            raise psycopg2.DataError(error_msg)
+        return mock.DEFAULT
+    mock_cursor.execute.side_effect = side_effect_execute
+
+    with pytest.raises(psycopg2.DataError, match=error_msg):
+        init_db.insert_test_data(mock_cursor)
+
+    mock_cursor.execute.assert_any_call("SELECT COUNT(*) FROM clientes;")
+    mock_cursor.execute.assert_any_call(
+        "INSERT INTO clientes (nombre, direccion, telefono, email) VALUES (%s, %s, %s, %s);",
+        faulty_clientes[0]
+    )
+
+
+def test_create_tables_db_config_empty_string_for_database_name(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: DB_CONFIG tiene una cadena vacía para 'database'."""
+    faulty_db_config = init_db.DB_CONFIG.copy()
+    faulty_db_config['database'] = '' # database es cadena vacía
+    monkeypatch.setattr(init_db, 'DB_CONFIG', faulty_db_config)
+
+    # psycopg2.connect(database='') podría resultar en error "database name is a required parameter"
+    # o "FATAL: database \"\" does not exist"
+    error_msg = 'FATAL: database "" does not exist'
+    mock_db["connect"].side_effect = psycopg2.OperationalError(error_msg)
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**faulty_db_config)
+    mock_insert_test_data_fixture.assert_not_called()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+def test_create_tables_db_config_empty_string_for_user(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: DB_CONFIG tiene 'user' como una cadena vacía."""
+    faulty_db_config = init_db.DB_CONFIG.copy()
+    faulty_db_config['user'] = ''  # user es una cadena vacía
+    monkeypatch.setattr(init_db, 'DB_CONFIG', faulty_db_config)
+
+    # El comportamiento de psycopg2 con user='' puede variar; podría intentar conectar
+    # como el usuario del SO o fallar si un nombre de usuario es estrictamente requerido.
+    # Simularemos un fallo común si el usuario es inválido o no se puede determinar.
+    error_msg = 'connection requires a valid username'
+    mock_db["connect"].side_effect = psycopg2.OperationalError(error_msg)
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**faulty_db_config)
+    mock_insert_test_data_fixture.assert_not_called()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+
+
+def test_create_tables_ddl_uses_undefined_db_function_error(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: Un DDL intenta usar una función de BD no definida (ej. en un DEFAULT)."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+
+    # Modificar un comando CREATE para usar una función inventada
+    original_commands = list(init_db.commands)
+    if not original_commands or not any("CREATE TABLE" in cmd for cmd in original_commands):
+        pytest.skip("No hay comandos CREATE TABLE para modificar en init_db.commands")
+
+    faulty_commands = original_commands[:]
+    for i, cmd in enumerate(faulty_commands):
+        if "CREATE TABLE IF NOT EXISTS productos" in cmd: # Elegir una tabla
+            faulty_commands[i] = cmd.replace("precio DECIMAL(10, 2) NOT NULL",
+                                             "precio DECIMAL(10, 2) DEFAULT mi_funcion_inexistente() NOT NULL")
+            break
+    else: # Si no se encontró la tabla productos, modificar la primera que sea CREATE TABLE
+        for i, cmd in enumerate(faulty_commands):
+            if "CREATE TABLE" in cmd:
+                faulty_commands[i] = cmd.replace(");", ", campo_test TEXT DEFAULT mi_funcion_inexistente());")
+                break
+    
+    monkeypatch.setattr(init_db, 'commands', tuple(faulty_commands))
+
+    error_msg = 'function mi_funcion_inexistente() does not exist'
+    
+    # El error ocurrirá después de los 5 drops y su commit
+    # y potencialmente después de algunos CREATEs válidos, dependiendo de dónde se insertó el comando erróneo.
+    def side_effect_execute(command, *args, **kwargs):
+        if "mi_funcion_inexistente()" in command:
+            raise psycopg2.ProgrammingError(error_msg)
+        return mock.DEFAULT
+    mock_cursor.execute.side_effect = side_effect_execute
+
+    init_db.create_tables()
+
+    assert mock_conn.commit.call_count == 1 # Commit de los drops
+    mock_insert_test_data_fixture.assert_not_called()
+    mock_conn.rollback.assert_called_once()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+
+
+def test_create_tables_db_config_invalid_connect_timeout_value(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: DB_CONFIG tiene un valor inválido para 'connect_timeout' (ej. negativo)."""
+    faulty_db_config = init_db.DB_CONFIG.copy()
+    faulty_db_config['connect_timeout'] = -5 # Timeout negativo es inválido
+    monkeypatch.setattr(init_db, 'DB_CONFIG', faulty_db_config)
+
+    # psycopg2 debería lanzar un error, posiblemente ValueError o OperationalError.
+    error_msg = "invalid value for \"connect_timeout\": -5" # Simulación de error
+    mock_db["connect"].side_effect = psycopg2.OperationalError(error_msg) # O ValueError
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**faulty_db_config)
+    mock_insert_test_data_fixture.assert_not_called()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+
+
+def test_create_tables_explicit_commit_on_already_closed_connection(mock_db, mock_insert_test_data_fixture, capsys):
+    """FAIL Test: Se intenta conn.commit() sobre una conexión ya cerrada explícitamente."""
+    mock_conn = mock_db["conn"]
+
+    # Simular que la conexión se cierra prematuramente (ej. por un error no manejado),
+    # y luego, incorrectamente, se intenta un commit.
+    # Esto es difícil de simular directamente en el flujo de create_tables sin modificarlo.
+    # Una forma es hacer que el primer commit cierre la conexión y luego el segundo commit falle.
+    
+    first_commit_completed = False
+    def commit_side_effect():
+        nonlocal first_commit_completed
+        if mock_conn.commit.call_count == 1: # Después del primer commit (post-drops)
+            first_commit_completed = True
+            mock_conn.close() # Simular que la conexión se cierra aquí
+            return # El primer commit tiene éxito (conceptualmente)
+        elif mock_conn.commit.call_count == 2 and first_commit_completed: # Segundo commit sobre conexión cerrada
+            # Esta excepción es la que se espera si se intenta operar sobre conexión cerrada
+            raise psycopg2.InterfaceError("connection already closed") 
+    
+    mock_conn.commit.side_effect = commit_side_effect
+    # La llamada a conn.close() desde el side_effect no usa el mock_conn.close directamente,
+    # sino que cambia el estado del objeto mock_conn.
+    # Necesitamos que mock_conn.close sea un MagicMock para rastrear la llamada desde el finally.
+    # Pero el side_effect llama al método 'close' del 'mock_conn' real.
+
+    # Para este test, es más simple simular que el segundo commit encuentra la conexión cerrada.
+    mock_conn.commit.side_effect = lambda: (_ for _ in ()).throw(psycopg2.InterfaceError("connection already closed")) if mock_conn.commit.call_count == 2 else None
+
+
+    init_db.create_tables()
+
+    assert mock_conn.commit.call_count == 2 # Se intentaron ambos commits
+    # El primer commit pasó (o no lanzó error), el segundo falló.
+    mock_insert_test_data_fixture.assert_called_once() # Asumiendo que insert_test_data ocurrió antes del segundo commit.
+    mock_conn.rollback.assert_called_once() # Rollback debido al error en el segundo commit
+    mock_conn.close.assert_called_once() # El finally de create_tables la cierra (o intenta)
+    captured = capsys.readouterr()
+    assert "Error al crear tablas: connection already closed" in captured.out
+
+
+def test_create_tables_db_config_password_is_none_behavior(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """BEHAVIOR Test: DB_CONFIG tiene password=None. psycopg2 intenta conectar (éxito o fallo de auth)."""
+    # Este test verifica que pasar password=None no causa un error de tipo en psycopg2.
+    # El resultado (éxito o fallo de autenticación) depende de la configuración del servidor.
+    # Aquí, simularemos un éxito para verificar que el None fue procesado.
+    
+    config_with_none_pass = init_db.DB_CONFIG.copy()
+    config_with_none_pass['password'] = None
+    monkeypatch.setattr(init_db, 'DB_CONFIG', config_with_none_pass)
+
+    # No añadir side_effect a mock_db["connect"] para que use el mock por defecto (éxito).
+    
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**config_with_none_pass)
+    # Verificar flujo de éxito completo
+    captured = capsys.readouterr()
+    assert "Tablas creadas y datos de prueba insertados correctamente." in captured.out
+    assert mock_db["conn"].commit.call_count == 2
+
+
+def test_create_tables_connection_autocommit_true_impact_on_commits(mock_db, mock_insert_test_data_fixture, capsys):
+    """BEHAVIOR Test: conn.autocommit=True; los commits explícitos no deberían fallar."""
+    mock_conn = mock_db["conn"]
+    
+    # Hacer que la conexión mockeada tenga autocommit=True
+    # Esto se hace después de que mock_db["connect"] devuelve mock_conn
+    original_connect_side_effect = mock_db["connect"].side_effect
+    
+    def set_autocommit_and_return_conn(*args, **kwargs):
+        # Si connect tenía un side_effect para fallar, lo preservamos
+        if callable(original_connect_side_effect) and not isinstance(original_connect_side_effect, mock.MagicMock) :
+            conn_obj = original_connect_side_effect(*args, **kwargs)
+        else: # Si es el mock por defecto o un valor de retorno
+            conn_obj = mock_db["conn"] # Usar el mock_conn de la fixture
+        
+        conn_obj.autocommit = True
+        # Los commits explícitos sobre una conexión autocommit pueden ser no-ops o ignorados.
+        # No deberían fallar.
+        conn_obj.commit = mock.MagicMock() # Re-mockear commit para este test
+        return conn_obj
+
+    mock_db["connect"].side_effect = set_autocommit_and_return_conn
+    
+    init_db.create_tables()
+
+    # Verificar que la conexión se estableció y se intentó configurar autocommit (implícito por el side_effect)
+    mock_db["connect"].assert_called_once()
+    
+    # Verificar que los commits explícitos fueron llamados (aunque sean no-op en modo autocommit)
+    # El mock_conn.commit re-mockeado en el side_effect capturará estas llamadas.
+    # Se espera que create_tables llame a conn.commit() dos veces.
+    # Necesitamos acceder al commit mockeado dentro del set_autocommit_and_return_conn,
+    # o verificar el call_count en el mock_conn original si el re-mock no es lo que queremos.
+    # Para esta prueba, verificaremos que el script no falla y que los puntos de commit son alcanzados.
+    
+    # Si mock_conn es el de la fixture, sus atributos son los mismos.
+    # La clave es que conn.commit() no debe levantar un error inesperado.
+    # El mock_conn.commit de la fixture registrará las llamadas.
+    assert mock_conn.commit.call_count == 2 # Los puntos de commit fueron alcanzados
+
+    captured = capsys.readouterr()
+    assert "Tablas creadas y datos de prueba insertados correctamente." in captured.out
+    mock_conn.rollback.assert_not_called() # No debería haber rollback si no hay errores
+
+
+def test_insert_test_data_fetchone_call_itself_raises_operational_error(mock_db, monkeypatch):
+    """FAIL Test: cur.fetchone() para SELECT COUNT(*) levanta OperationalError."""
+    mock_cursor = mock_db["cursor"]
+    
+    # Hacer que la llamada a fetchone() falle con OperationalError
+    error_msg = "server closed the connection during fetch"
+    mock_cursor.fetchone.side_effect = psycopg2.OperationalError(error_msg)
+
+    with pytest.raises(psycopg2.OperationalError, match=error_msg):
+        init_db.insert_test_data(mock_cursor)
+    
+    mock_cursor.execute.assert_called_once_with("SELECT COUNT(*) FROM clientes;")
+    mock_cursor.fetchone.assert_called_once() # Se intentó llamar a fetchone
+
+
+def test_create_tables_db_config_is_string_not_dict_type_error(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: init_db.DB_CONFIG es un string (DSN), pero se usa con **DB_CONFIG."""
+    # Simular que DB_CONFIG es un string DSN
+    dsn_string = "dbname=test host=localhost user=postgres"
+    monkeypatch.setattr(init_db, 'DB_CONFIG', dsn_string)
+
+    # psycopg2.connect(**"some_string") lanzará TypeError: 'str' object is not a mapping
+    error_msg = "'str' object is not a mapping" # O un error similar de desempaquetado
+    # El error exacto es: "argument after ** must be a mapping, not str"
+    mock_db["connect"].side_effect = TypeError("argument after ** must be a mapping, not str")
+
+
+    init_db.create_tables()
+
+    # mock_db["connect"] es llamado, pero falla antes de que psycopg2 procese los args.
+    assert mock_db["connect"].called
+    mock_insert_test_data_fixture.assert_not_called()
+    captured = capsys.readouterr()
+    assert "Error al crear tablas: argument after ** must be a mapping, not str" in captured.out
+
+
+def test_create_tables_success_with_empty_commands_and_empty_data_lists(mock_db, monkeypatch, capsys):
+    """SUCCESS Test: Flujo de éxito con init_db.commands, .clientes y .productos vacíos."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+
+    monkeypatch.setattr(init_db, 'commands', ())
+    monkeypatch.setattr(init_db, 'clientes', [])
+    monkeypatch.setattr(init_db, 'productos', [])
+
+    # No usamos mock_insert_test_data_fixture para que se ejecute el insert_test_data real
+    # y verifique el conteo de clientes (que será 0).
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once()
+    mock_conn.cursor.assert_called_once()
+
+    # Operaciones esperadas:
+    # 5 DROPs
+    # 1 COMMIT (post-drops)
+    # 0 CREATEs/SEQUENCEs (porque init_db.commands está vacío)
+    # 1 SELECT COUNT(*) FROM clientes (desde insert_test_data)
+    # 0 INSERTs (porque listas de datos están vacías)
+    # 1 COMMIT (post-"creates"/inserts)
+    # Total execute: 5 (drops) + 1 (count) = 6
+    
+    assert mock_cursor.execute.call_count == 6
+    mock_cursor.execute.assert_any_call("SELECT COUNT(*) FROM clientes;") # De insert_test_data
+    
+    # Verificar que no se hicieron inserts
+    insert_calls = [call for call in mock_cursor.execute.call_args_list if "INSERT INTO" in call[0][0]]
+    assert len(insert_calls) == 0
+    
+    assert mock_conn.commit.call_count == 2
+    mock_conn.rollback.assert_not_called()
+    mock_conn.close.assert_called_once()
+    captured = capsys.readouterr()
+    assert "Tablas creadas y datos de prueba insertados correctamente." in captured.out
+
+
+def test_create_tables_programming_error_lock_not_available_on_drop_table(mock_db, mock_insert_test_data_fixture, capsys):
+    """FAIL Test: ProgrammingError (lock_not_available) durante un DROP TABLE."""
+    mock_cursor = mock_db["cursor"]
+    mock_conn = mock_db["conn"]
+    
+    # Error code 55P03: lock_not_available
+    error_msg = "lock not available" # Simplificado; el mensaje real es más largo
+    pgcode = "55P03"
+    
+    # Simular que el primer DROP TABLE falla con este error
+    def side_effect_execute(command, *args, **kwargs):
+        if "DROP TABLE" in command:
+            # Crear un objeto de error que tenga pgcode
+            err = psycopg2.ProgrammingError(error_msg)
+            err.pgcode = pgcode
+            raise err
+        return mock.DEFAULT
+    mock_cursor.execute.side_effect = side_effect_execute
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once()
+    mock_conn.cursor.assert_called_once()
+    mock_cursor.execute.assert_called_once() # Falla en el primer DROP
+
+    mock_insert_test_data_fixture.assert_not_called()
+    mock_conn.commit.assert_not_called()
+    mock_conn.rollback.assert_called_once()
+    mock_conn.close.assert_called_once()
+    captured = capsys.readouterr()
+    # Verificar que el mensaje de error capturado contiene el texto, y opcionalmente el código.
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+    # Si quieres verificar que la excepción tiene el pgcode, necesitarías capturar la excepción
+    # directamente en el test, lo cual es más complejo si create_tables la maneja.
+    # El print(e) no incluirá el pgcode a menos que el __str__ de la excepción lo haga.
+
+def test_create_tables_server_notice_during_execute_proceeds_successfully(mock_db, mock_insert_test_data_fixture, capsys):
+    """SUCCESS Test: Una 'NOTICE' del servidor durante execute() no detiene el script."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+
+    # Simular que conn.notices se pobla (psycopg2 lo hace si el servidor envía notices)
+    # y que la ejecución de un comando también añade una notice.
+    # La prueba principal es que el script no falla por esto.
+    mock_conn.notices = []
+    original_execute = mock_cursor.execute
+
+    def execute_with_server_notice(command, *args, **kwargs):
+        if "CREATE TABLE IF NOT EXISTS productos" in command: # Un punto arbitrario
+            mock_conn.notices.append(("NOTICE", "Creando tabla productos con configuración especial."))
+        return original_execute(command, *args, **kwargs) # Llamar al mock original
+
+    mock_cursor.execute.side_effect = execute_with_server_notice
+
+    init_db.create_tables()
+
+    # Verificar flujo de éxito
+    assert mock_db["connect"].called
+    assert mock_conn.commit.call_count == 2
+    mock_conn.rollback.assert_not_called()
+    mock_conn.close.assert_called_once()
+    captured = capsys.readouterr()
+    assert "Tablas creadas y datos de prueba insertados correctamente." in captured.out
+    # Opcionalmente, verificar que la notice fue "recibida"
+    assert len(mock_conn.notices) > 0
+    assert mock_conn.notices[0][1] == "Creando tabla productos con configuración especial."
+
+
+def test_create_tables_db_config_very_long_database_name(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: DB_CONFIG['database'] es un string extremadamente largo."""
+    long_db_name = "a" * 1024 # Nombre de base de datos muy largo
+    faulty_db_config = init_db.DB_CONFIG.copy()
+    faulty_db_config['database'] = long_db_name
+    monkeypatch.setattr(init_db, 'DB_CONFIG', faulty_db_config)
+
+    # El servidor o psycopg2 podrían rechazar un nombre tan largo.
+    error_msg = "database name too long" # Mensaje de error simulado
+    mock_db["connect"].side_effect = psycopg2.OperationalError(error_msg)
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**faulty_db_config)
+    mock_insert_test_data_fixture.assert_not_called()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+
+
+def test_create_tables_commands_contains_duplicate_identical_create_table_ddl(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """SUCCESS Test: init_db.commands tiene un DDL CREATE TABLE IF NOT EXISTS duplicado."""
+    original_commands = list(init_db.commands)
+    if not any("CREATE TABLE IF NOT EXISTS clientes" in cmd for cmd in original_commands):
+        pytest.skip("DDL para 'clientes' no encontrado para duplicar.")
+
+    cliente_ddl = [cmd for cmd in original_commands if "CREATE TABLE IF NOT EXISTS clientes" in cmd][0]
+    # Insertar el duplicado junto al original
+    idx = original_commands.index(cliente_ddl)
+    duplicated_commands = tuple(original_commands[:idx+1] + [cliente_ddl] + original_commands[idx+1:])
+    monkeypatch.setattr(init_db, 'commands', duplicated_commands)
+
+    init_db.create_tables() # Debería tener éxito debido a IF NOT EXISTS
+
+    captured = capsys.readouterr()
+    assert "Tablas creadas y datos de prueba insertados correctamente." in captured.out
+    # Verificar que se ejecutaron todos los comandos (incluyendo el duplicado)
+    assert mock_db["cursor"].execute.call_count == 5 + len(duplicated_commands)
+
+
+def test_create_tables_cursor_already_closed_on_execute(mock_db, mock_insert_test_data_fixture, capsys):
+    """FAIL Test: cur.execute() llamado sobre un cursor ya cerrado."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+
+    # Simular que el cursor se cierra después del primer DROP, antes del segundo.
+    error_msg = "cursor already closed"
+    def side_effect_execute(command, *args, **kwargs):
+        if mock_cursor.execute.call_count == 1: # Después del primer execute (DROP)
+            mock_cursor.close() # Cerrar el cursor prematuramente
+            # El siguiente mock_cursor.execute fallará si se llama al original
+            # Si el cursor real estuviera cerrado, el siguiente execute fallaría
+            # Aquí necesitamos que el mock_cursor.execute *siguiente* falle.
+            # Para ello, hacemos que el original_execute sea llamado sobre un cursor cerrado.
+            # Esto es difícil de simular limpiamente con el mismo objeto mock_cursor.
+            # Es más fácil hacer que el execute mismo levante el error apropiado.
+            pass # Permitir que este primer execute pase
+        elif "DROP" in command and mock_cursor.execute.call_count > 1: # Siguientes DROPs
+             # Si el cursor real se cerró, execute() fallaría.
+             # Para simular, levantamos el error aquí.
+             raise psycopg2.InterfaceError(error_msg)
+        return mock.DEFAULT # Para el primer DROP
+
+    # Más simple: hacer que el segundo execute falle directamente.
+    fail_on_call_nth = 2
+    def simpler_side_effect(command, *args, **kwargs):
+        if mock_cursor.execute.call_count == fail_on_call_nth:
+            raise psycopg2.InterfaceError(error_msg)
+        return mock.DEFAULT
+    mock_cursor.execute.side_effect = simpler_side_effect
+
+
+    init_db.create_tables()
+
+    assert mock_cursor.execute.call_count == fail_on_call_nth
+    mock_conn.commit.assert_not_called()
+    mock_conn.rollback.assert_called_once()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+
+
+def test_create_tables_db_config_with_application_name_success(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """SUCCESS Test: DB_CONFIG incluye 'application_name', connect lo usa y el script tiene éxito."""
+    app_name_config = init_db.DB_CONFIG.copy()
+    app_name_config['application_name'] = 'MiAppDeInitDB'
+    monkeypatch.setattr(init_db, 'DB_CONFIG', app_name_config)
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**app_name_config)
+    captured = capsys.readouterr()
+    assert "Tablas creadas y datos de prueba insertados correctamente." in captured.out
+
+
+@mock.patch('init_db.insert_test_data') # Mockear globalmente para la segunda llamada
+@mock.patch('init_db.psycopg2.connect') # Mockear globalmente para la segunda llamada
+def test_create_tables_called_twice_sequentially_idempotency(mock_psycopg2_connect, mock_insert_test_data_fn, capsys, monkeypatch):
+    """SUCCESS Test: llamar a init_db.create_tables() dos veces seguidas es idempotente."""
+    # Configurar mocks para la primera llamada (similar a la fixture mock_db)
+    mock_conn1 = mock.MagicMock(spec=psycopg2.extensions.connection)
+    mock_cursor1 = mock.MagicMock(spec=psycopg2.extensions.cursor)
+    mock_psycopg2_connect.return_value = mock_conn1
+    mock_conn1.cursor.return_value.__enter__.return_value = mock_cursor1
+
+    # --- Primera llamada ---
+    init_db.create_tables()
+    captured1 = capsys.readouterr()
+    assert "Tablas creadas y datos de prueba insertados correctamente." in captured1.out
+    mock_psycopg2_connect.assert_called_once_with(**init_db.DB_CONFIG)
+    mock_insert_test_data_fn.assert_called_once_with(mock_cursor1)
+    assert mock_conn1.commit.call_count == 2
+    mock_conn1.close.assert_called_once()
+
+    # Resetear mocks para la segunda llamada
+    mock_psycopg2_connect.reset_mock()
+    mock_insert_test_data_fn.reset_mock()
+    mock_conn2 = mock.MagicMock(spec=psycopg2.extensions.connection)
+    mock_cursor2 = mock.MagicMock(spec=psycopg2.extensions.cursor)
+    mock_psycopg2_connect.return_value = mock_conn2
+    mock_conn2.cursor.return_value.__enter__.return_value = mock_cursor2
+
+    # --- Segunda llamada ---
+    # Asegurar que DB_CONFIG y commands no fueron alterados por la primera llamada si eran globales
+    # (asumiendo que la fixture mock_db no los altera permanentemente en el módulo)
+    # Si son alterados por el test anterior, este test podría ser inestable.
+    # Es mejor si cada test usa monkeypatch para aislar cambios en init_db.DB_CONFIG y init_db.commands
+    
+    init_db.create_tables()
+    captured2 = capsys.readouterr()
+    assert "Tablas creadas y datos de prueba insertados correctamente." in captured2.out
+    mock_psycopg2_connect.assert_called_once_with(**init_db.DB_CONFIG) # Llamado de nuevo
+    mock_insert_test_data_fn.assert_called_once_with(mock_cursor2) # Llamado de nuevo
+    assert mock_conn2.commit.call_count == 2 # Commits de nuevo
+    mock_conn2.close.assert_called_once() # Cerrado de nuevo
+
+
+def test_create_tables_memory_error_during_insert_test_data_loop(mock_db, monkeypatch, capsys):
+    """FAIL Test: MemoryError durante el bucle de inserción en insert_test_data."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+    mock_cursor.fetchone.return_value = (0,) # Para entrar al bucle de inserts
+
+    # No usar mock_insert_test_data_fixture, queremos que se ejecute el real.
+    # Simular MemoryError durante la ejecución de un INSERT
+    # Asumimos que hay al menos un cliente en init_db.clientes
+    if not init_db.clientes:
+        monkeypatch.setattr(init_db, 'clientes', [("ClienteMem", "Dir", "Tel", "Email")])
+
+    original_execute = mock_cursor.execute
+    def execute_raises_memory_error(command, data_tuple=None):
+        if "INSERT INTO clientes" in command:
+            raise MemoryError("Simulated MemoryError during insert")
+        return original_execute(command, data_tuple)
+    mock_cursor.execute.side_effect = execute_raises_memory_error
+
+    init_db.create_tables()
+
+    assert mock_conn.commit.call_count == 1 # Solo el commit de drops/creates
+    mock_conn.rollback.assert_called_once()
+    captured = capsys.readouterr()
+    assert "Error al crear tablas: Simulated MemoryError during insert" in captured.out
+
+
+def test_create_tables_ddl_commands_are_valid_strings_simple_check(mock_db, mock_insert_test_data_fixture):
+    """SUCCESS Test: Los comandos DDL en init_db.commands son strings y no contienen placeholders básicos."""
+    if not init_db.commands:
+        pytest.skip("init_db.commands está vacío.")
+    
+    for command in init_db.commands:
+        assert isinstance(command, str), f"Comando no es string: {command}"
+        assert len(command.strip()) > 0, f"Comando es una cadena vacía o solo espacios: '{command}'"
+        # Chequeo muy básico contra placeholders de parámetros en DDL (no deberían estar)
+        assert "%s" not in command, f"Comando DDL contiene '%s': {command}"
+        assert "?" not in command, f"Comando DDL contiene '?': {command}"
+    
+    # Si pasa las aserciones, ejecutar create_tables para asegurar que el flujo general es ok.
+    init_db.create_tables()
+    mock_insert_test_data_fixture.assert_called_once() # Para confirmar que se llegó al final del try
+
+
+def test_create_tables_db_config_options_invalid_search_path_schema(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: Opción 'search_path' en DB_CONFIG referencia un esquema no existente causando error en CREATE."""
+    faulty_db_config = init_db.DB_CONFIG.copy()
+    faulty_db_config['options'] = "-c search_path=esquema_que_no_existe,public"
+    monkeypatch.setattr(init_db, 'DB_CONFIG', faulty_db_config)
+    mock_cursor = mock_db["cursor"]
+
+    # Simular que la conexión tiene éxito, pero el primer CREATE TABLE (sin esquema cualificado) falla.
+    error_msg = 'schema "esquema_que_no_existe" does not exist' # O 'relation "..." does not exist' si busca en el esquema equivocado.
+                                                              # 'no schema has been selected to create in'
+    
+    # El error ocurrirá en el primer CREATE después de los drops y su commit.
+    fail_on_call_nth = 6 
+    def side_effect_execute(command, *args, **kwargs):
+        if mock_cursor.execute.call_count == fail_on_call_nth and "CREATE TABLE" in command:
+            raise psycopg2.ProgrammingError(f'no schema has been selected to create in (tried {command[:30]}...)')
+        return mock.DEFAULT
+    mock_cursor.execute.side_effect = side_effect_execute
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**faulty_db_config)
+    assert mock_db["conn"].commit.call_count == 1 # Commit de drops
+    mock_insert_test_data_fixture.assert_not_called()
+    captured = capsys.readouterr()
+    assert "Error al crear tablas: no schema has been selected to create in" in captured.out
+
+
+def test_create_tables_conn_close_fails_after_successful_rollback(mock_db, capsys):
+    """FAIL Test: Un error en try, rollback exitoso, pero conn.close() en finally falla."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+
+    # 1. Error inicial en el bloque try
+    initial_error_msg = "Error inicial simulado en try-block"
+    mock_cursor.execute.side_effect = psycopg2.ProgrammingError(initial_error_msg)
+
+    # 2. conn.rollback() funciona (comportamiento por defecto del mock)
+
+    # 3. conn.close() en el finally falla
+    close_error_msg = "Fallo simulado en conn.close()"
+    mock_conn.close.side_effect = psycopg2.OperationalError(close_error_msg)
+
+    # La excepción de close() se propagará fuera de create_tables
+    with pytest.raises(psycopg2.OperationalError, match=close_error_msg):
+        init_db.create_tables()
+
+    # Verificar que el error original fue impreso por el except de create_tables
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {initial_error_msg}" in captured.out
+
+    # Verificar llamadas
+    mock_cursor.execute.assert_called_once() # Falló aquí
+    mock_conn.rollback.assert_called_once()  # Rollback fue llamado
+    mock_conn.close.assert_called_once()     # close fue llamado y falló
+
+
+def test_insert_test_data_clientes_list_contains_empty_tuples(mock_db, monkeypatch):
+    """FAIL Test: init_db.clientes contiene tuplas vacías '()', causando error en execute."""
+    mock_cursor = mock_db["cursor"]
+    mock_cursor.fetchone.return_value = (0,) # Para intentar inserts
+
+    faulty_clientes = [("ClienteValido", "D", "T", "E"), ()] # Tupla vacía
+    monkeypatch.setattr(init_db, 'clientes', faulty_clientes)
+    monkeypatch.setattr(init_db, 'productos', [])
+
+    # psycopg2 execute(sql, ()) para un INSERT con múltiples %s dará error.
+    # "not enough arguments for format string" o similar.
+    error_msg = "not all arguments converted during string formatting" # Típico de psycopg2
+    
+    def side_effect_execute(command, data_tuple=None):
+        if "INSERT INTO clientes" in command:
+            if not data_tuple: # Si es una tupla vacía
+                raise TypeError(error_msg) # O ProgrammingError
+        return mock.DEFAULT # Para el primer cliente válido
+    
+    # Más directamente: si se pasa una tupla vacía a un execute que espera N parámetros.
+    # El error puede ser TypeError por el formateo de C, o ProgrammingError por la librería.
+    # Vamos a simular que el segundo INSERT falla.
+    
+    call_count = 0
+    def selective_fail_execute(command, data_tuple=None):
+        nonlocal call_count
+        call_count +=1
+        if call_count == 1: # SELECT COUNT(*)
+            return mock.DEFAULT
+        if call_count == 2: # Primer cliente (válido)
+             assert data_tuple == faulty_clientes[0]
+             return mock.DEFAULT
+        if call_count == 3 and command.startswith("INSERT INTO clientes") and data_tuple == (): # Cliente con tupla vacía
+            raise psycopg2.ProgrammingError("query argument 'params' must be a sequence of sequences or a generator in execute_values mode")
+            # O si no es execute_values, podría ser un error de "not enough parameters".
+            # Para execute() normal:
+            # raise psycopg2.ProgrammingError("not enough arguments for format string") -> esto es más de la capa C
+            # psycopg2 suele dar errores más estructurados como "wrong number of arguments"
+            # Para este caso, el error más probable es si el driver intenta usar la tupla vacía para reemplazar N %s.
+            # El error de "execute_values mode" es si se usa con una lista de tuplas vacías.
+            # Si es execute(sql, params) y params=(), psycopg2 trata de matchear con %s.
+            # Si sql = "INSERT ... VALUES (%s, %s, %s, %s)" y params=(), da error.
+            # "not all arguments converted during string formatting" (TypeError) es común.
+            raise TypeError(error_msg)
+
+
+    mock_cursor.execute.side_effect = selective_fail_execute
+
+
+    with pytest.raises(TypeError, match=error_msg):
+        init_db.insert_test_data(mock_cursor)
+
+    assert mock_cursor.execute.call_count == 3 # COUNT, primer INSERT (OK), segundo INSERT (falla)
+
+
+def test_create_tables_drop_table_no_if_exists_table_missing_error(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: DROP TABLE (sin IF EXISTS) para una tabla no existente falla."""
+    mock_cursor = mock_db["cursor"]
+    
+    # Modificar el primer comando DROP para quitar "IF EXISTS"
+    # Asumimos que el primer comando DROP es para una tabla.
+    # Esta prueba es más sobre la robustez del DDL en init_db.py.
+    # Aquí simularemos que el DDL *en el script* no tiene IF EXISTS.
+    # El script de test no puede modificar init_db.py, así que simulamos el error.
+
+    # Simular que el primer DROP (modificado conceptualmente) falla
+    error_msg = 'table "factura_items" does not exist' # Asumiendo que es la primera tabla dropeada
+    
+    def side_effect_execute(command, *args, **kwargs):
+        # Solo fallar para el primer comando si es un DROP TABLE
+        if mock_cursor.execute.call_count == 1 and "DROP TABLE factura_items CASCADE" in command: # Asumiendo que este es el primer drop
+            # Simular que "IF EXISTS" fue omitido y la tabla no existe
+            raise psycopg2.ProgrammingError(error_msg)
+        return mock.DEFAULT
+    mock_cursor.execute.side_effect = side_effect_execute
+    
+    init_db.create_tables()
+    
+    mock_cursor.execute.assert_called_once() # Falló en el primer drop
+    mock_db["conn"].commit.assert_not_called()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+
+
+def test_create_tables_typeerror_on_commit_if_not_callable(mock_db, mock_insert_test_data_fixture, capsys):
+    """FAIL Test: conn.commit es accidentalmente un atributo no llamable."""
+    mock_conn = mock_db["conn"]
+    
+    # Hacer que conn.commit sea un atributo no llamable (ej. un string)
+    # Esto debe ocurrir *antes* de que create_tables lo llame.
+    # La fixture mock_db configura mock_conn.commit como un MagicMock.
+    # Lo reemplazamos aquí.
+    mock_conn.commit = "no soy llamable"
+
+    init_db.create_tables() # Esto debería causar TypeError: 'str' object is not callable
+
+    # El error ocurriría en el primer intento de commit (después de los drops)
+    assert mock_db["cursor"].execute.call_count == 5 # Se ejecutaron los drops
+    mock_db["conn"].rollback.assert_called_once() # El except debería hacer rollback
+    captured = capsys.readouterr()
+    assert "Error al crear tablas: 'str' object is not callable" in captured.out
+
+
+def test_insert_test_data_count_query_returns_one_row_two_columns(mock_db, monkeypatch):
+    """FAIL Test: fetchone() de SELECT COUNT(*) retorna una tupla con dos columnas (0, 1)."""
+    mock_cursor = mock_db["cursor"]
+    # Simular que fetchone retorna una tupla con más de un elemento: (count, extra_col)
+    mock_cursor.fetchone.return_value = (5, 10) # ej. (5 clientes, 10 algo más)
+
+    # insert_test_data espera `count_result[0]` para obtener el conteo.
+    # Si `count_result = (5, 10)`, entonces `count_result[0]` es 5, lo cual es correcto.
+    # La lógica `if count_result[0] > 0:` funcionaría.
+    # Este test, tal como está, no fallaría la lógica actual.
+    # Para que falle, la estructura de datos tendría que ser inesperada de otra forma,
+    # o la indexación ser incorrecta.
+    # Por ejemplo, si se esperara que count_result sea solo el entero.
+    # La lógica actual `count = cur.fetchone()[0]` es robusta a columnas extra si la primera es el conteo.
+
+    # Cambiemos el escenario: ¿Qué pasa si fetchone retorna una lista en lugar de una tupla?
+    mock_cursor.fetchone.return_value = [5] # Lista con un elemento
+    
+    # Esto debería funcionar bien también, ya que [5][0] es 5.
+
+    # Para que falle de una manera nueva: si el primer elemento NO es el conteo o no es un número.
+    mock_cursor.fetchone.return_value = ("texto_no_numerico", 10)
+
+    with pytest.raises(TypeError) as excinfo: # Al hacer `if count > 0`
+        init_db.insert_test_data(mock_cursor)
+    
+    assert "'>' not supported between instances of 'str' and 'int'" in str(excinfo.value)
+    mock_cursor.execute.assert_called_once_with("SELECT COUNT(*) FROM clientes;")
+
+
+def test_create_tables_db_config_with_gssencmode_no_gsslib(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: DB_CONFIG especifica gssencmode='prefer' pero la librería GSSAPI no está disponible."""
+    faulty_db_config = init_db.DB_CONFIG.copy()
+    faulty_db_config['gssencmode'] = 'prefer' # Podría ser 'require' también
+    monkeypatch.setattr(init_db, 'DB_CONFIG', faulty_db_config)
+
+    error_msg = "GSSAPI library not found" # Error típico de psycopg2 en este caso
+    mock_db["connect"].side_effect = psycopg2.OperationalError(error_msg)
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**faulty_db_config)
+    mock_insert_test_data_fixture.assert_not_called()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+def test_create_tables_large_number_of_commands_in_init_db_commands_success(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """SUCCESS Test: init_db.commands tiene un gran número de DDLs válidos (ej. 200)."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+    
+    # Crear una larga lista de comandos DDL simples y válidos
+    num_commands = 200
+    large_commands_list = [f"CREATE TABLE IF NOT EXISTS test_table_{i} (id INT);" for i in range(num_commands)]
+    monkeypatch.setattr(init_db, 'commands', tuple(large_commands_list))
+
+    init_db.create_tables() # Debería ejecutarse sin problemas de bucle en Python
+
+    # Verificar que todos los comandos (drops + large_commands_list) se intentaron ejecutar
+    assert mock_cursor.execute.call_count == 5 + num_commands
+    mock_insert_test_data_fixture.assert_called_once()
+    assert mock_conn.commit.call_count == 2 # Ambos commits
+    captured = capsys.readouterr()
+    assert "Tablas creadas y datos de prueba insertados correctamente." in captured.out
+
+
+def test_create_tables_db_config_ssl_files_not_found_error(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: DB_CONFIG especifica archivos SSL (cert, key) que no existen."""
+    faulty_db_config = init_db.DB_CONFIG.copy()
+    faulty_db_config['sslmode'] = 'require'
+    faulty_db_config['sslcert'] = '/path/to/nonexistent/client.crt'
+    faulty_db_config['sslkey'] = '/path/to/nonexistent/client.key'
+    monkeypatch.setattr(init_db, 'DB_CONFIG', faulty_db_config)
+
+    error_msg = "SSL error: certificate file /path/to/nonexistent/client.crt not found" # Mensaje simulado
+    mock_db["connect"].side_effect = psycopg2.OperationalError(error_msg)
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**faulty_db_config)
+    mock_insert_test_data_fixture.assert_not_called()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+
+
+def test_create_tables_command_in_commands_is_integer_type_error(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: Un item en init_db.commands es un entero, causando TypeError en execute."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+    original_commands = list(init_db.commands)
+    if not original_commands: original_commands.append("CREATE TABLE dummy (id int);") # Asegurar que hay algo
+    
+    faulty_commands = tuple(original_commands[:1] + [12345] + original_commands[1:]) # 12345 como comando
+    monkeypatch.setattr(init_db, 'commands', faulty_commands)
+
+    error_msg = "query argument must be a string" # psycopg2 espera un string para el query
+    
+    # El error ocurrirá después de los 5 drops, su commit, y el primer comando CREATE válido.
+    fail_on_call_nth = 5 + 1 + 1 # Drops + commit + 1er CREATE + el entero
+    def side_effect_execute(command, *args, **kwargs):
+        if mock_cursor.execute.call_count == fail_on_call_nth and isinstance(command, int):
+            raise TypeError(error_msg)
+        return mock.DEFAULT
+    mock_cursor.execute.side_effect = side_effect_execute
+    
+    init_db.create_tables()
+
+    assert mock_cursor.execute.call_count == fail_on_call_nth
+    assert mock_conn.commit.call_count == 1 # Solo el commit post-drops
+    mock_conn.rollback.assert_called_once()
+    captured = capsys.readouterr()
+    assert f"Error al crear tablas: {error_msg}" in captured.out
+
+
+def test_create_tables_db_config_dbname_with_problematic_chars_success(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """SUCCESS Test: DB_CONFIG['database'] tiene espacios y comillas; psycopg2 debe manejarlo."""
+    problematic_db_name_config = init_db.DB_CONFIG.copy()
+    problematic_db_name_config['database'] = "Mi Base de Datos con 'Comillas' y Espacios"
+    monkeypatch.setattr(init_db, 'DB_CONFIG', problematic_db_name_config)
+
+    # Asumimos que psycopg2 maneja esto correctamente y la conexión (mockeada) tiene éxito.
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**problematic_db_name_config)
+    captured = capsys.readouterr()
+    assert "Tablas creadas y datos de prueba insertados correctamente." in captured.out
+
+
+def test_create_tables_keyboard_interrupt_during_commit(mock_db, mock_insert_test_data_fixture, capsys):
+    """FAIL Test: KeyboardInterrupt durante una llamada a conn.commit()."""
+    mock_conn = mock_db["conn"]
+    
+    # Simular KeyboardInterrupt durante el primer commit (post-drops)
+    mock_conn.commit.side_effect = KeyboardInterrupt("Simulated Ctrl+C during commit")
+
+    # KeyboardInterrupt hereda de BaseException, no de Exception.
+    # El bloque `except (psycopg2.Error, Exception) as e:` en create_tables no lo atrapará.
+    # Por lo tanto, se propagará fuera de create_tables.
+    with pytest.raises(KeyboardInterrupt, match="Simulated Ctrl+C during commit"):
+        init_db.create_tables()
+
+    # Verificar qué se alcanzó antes del error
+    assert mock_db["cursor"].execute.call_count == 5 # Drops ejecutados
+    mock_conn.commit.assert_called_once()      # Se intentó el primer commit
+    
+    # El bloque finally de create_tables debería haberse ejecutado ANTES de que KeyboardInterrupt se propague.
+    # A menos que el KeyboardInterrupt sea tan abrupto que el finally no se complete.
+    # Python generalmente intenta ejecutar los finally.
+    mock_conn.close.assert_called_once()
+    
+    # No debería haber mensaje de "Error al crear tablas" porque el except no lo atrapó.
+    captured = capsys.readouterr()
+    assert "Error al crear tablas:" not in captured.out
+
+
+def test_create_tables_db_config_is_userdict_instance_success(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """SUCCESS Test: DB_CONFIG es una instancia de UserDict, connect debe funcionar."""
+    from collections import UserDict
+    user_dict_config = UserDict(init_db.DB_CONFIG)
+    monkeypatch.setattr(init_db, 'DB_CONFIG', user_dict_config)
+
+    init_db.create_tables()
+
+    # connect(**kwargs) debería funcionar bien con un UserDict ya que es un mapping.
+    mock_db["connect"].assert_called_once_with(**user_dict_config)
+    captured = capsys.readouterr()
+    assert "Tablas creadas y datos de prueba insertados correctamente." in captured.out
+
+
+def test_insert_test_data_clientes_tuple_mixed_invalid_python_type_for_sql(mock_db, monkeypatch):
+    """FAIL Test: Una tupla en clientes tiene un tipo Python (ej. dict) no convertible por psycopg2 para un %s."""
+    mock_cursor = mock_db["cursor"]
+    mock_cursor.fetchone.return_value = (0,)
+
+    # Un diccionario donde se espera un string para la dirección
+    faulty_clientes_data = [("ClienteValido", {"calle": "elm", "numero": 123}, "Telefono", "email@test.com")]
+    monkeypatch.setattr(init_db, 'clientes', faulty_clientes_data)
+    monkeypatch.setattr(init_db, 'productos', [])
+
+    # psycopg2 lanzará un error al intentar adaptar el diccionario a un tipo SQL string.
+    # psycopg2.ProgrammingError: can't adapt type 'dict'
+    error_msg = "can't adapt type 'dict'"
+    def side_effect_execute(command, data_tuple=None):
+        if "INSERT INTO clientes" in command and isinstance(data_tuple[1], dict):
+            raise psycopg2.ProgrammingError(error_msg)
+        return mock.DEFAULT
+    mock_cursor.execute.side_effect = side_effect_execute
+
+    with pytest.raises(psycopg2.ProgrammingError, match=error_msg):
+        init_db.insert_test_data(mock_cursor)
+
+    mock_cursor.execute.assert_any_call("SELECT COUNT(*) FROM clientes;")
+    mock_cursor.execute.assert_any_call(
+        "INSERT INTO clientes (nombre, direccion, telefono, email) VALUES (%s, %s, %s, %s);",
+        faulty_clientes_data[0]
+    )
+
+
+def test_create_tables_connect_operational_error_server_refused_connection(mock_db, mock_insert_test_data_fixture, capsys):
+    """FAIL Test: OperationalError de psycopg2.connect por 'connection refused'."""
+    error_msg = "Connection refused. Check that thehostname and port are correct and that the postmaster is running."
+    mock_db["connect"].side_effect = psycopg2.OperationalError(error_msg)
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**mock_db["db_config"])
+    mock_insert_test_data_fixture.assert_not_called()
+    captured = capsys.readouterr()
+    assert "Connection refused" in captured.out # Parte del mensaje
+    assert "Error al crear tablas:" in captured.out
+
+
+def test_create_tables_connect_operational_error_password_required_not_supplied(mock_db, mock_insert_test_data_fixture, monkeypatch, capsys):
+    """FAIL Test: OperationalError porque se requiere contraseña pero no se dio (y otras auth fallan)."""
+    # Simular que no se provee contraseña y el servidor la requiere
+    config_no_pass = init_db.DB_CONFIG.copy()
+    if 'password' in config_no_pass:
+        del config_no_pass['password'] # Quitar contraseña
+    monkeypatch.setattr(init_db, 'DB_CONFIG', config_no_pass)
+    
+    error_msg = "fe_sendauth: no password supplied" # Mensaje común para auth fallida por falta de pass
+    mock_db["connect"].side_effect = psycopg2.OperationalError(error_msg)
+
+    init_db.create_tables()
+
+    mock_db["connect"].assert_called_once_with(**config_no_pass)
+    mock_insert_test_data_fixture.assert_not_called()
+    captured = capsys.readouterr()
+    assert "no password supplied" in captured.out
+    assert "Error al crear tablas:" in captured.out
+
+
+def test_create_tables_rollback_failure_after_insert_test_data_error(mock_db, monkeypatch, capsys):
+    """FAIL Test: insert_test_data falla, luego conn.rollback() también falla."""
+    mock_conn = mock_db["conn"]
+    mock_cursor = mock_db["cursor"]
+    # No usar mock_insert_test_data_fixture
+    
+    # 1. Hacer que insert_test_data falle
+    error_in_insert = ValueError("Fallo en insert_test_data")
+    monkeypatch.setattr(init_db, 'insert_test_data', mock.MagicMock(side_effect=error_in_insert))
+
+    # 2. Hacer que conn.rollback() falle
+    error_in_rollback = psycopg2.OperationalError("Fallo en rollback")
+    mock_conn.rollback.side_effect = error_in_rollback
+
+    # La excepción original de insert_test_data será impresa por create_tables.
+    # La excepción de rollback se propagará si no es manejada dentro del except de create_tables.
+    with pytest.raises(psycopg2.OperationalError, match="Fallo en rollback"):
+        init_db.create_tables()
+
+    # Verificar que se intentó todo hasta el fallo
+    # Drops, Creates, 1er Commit, intento de insert_test_data, intento de rollback
+    init_db.insert_test_data.assert_called_once_with(mock_cursor) # insert_test_data fue llamado
+    assert mock_conn.commit.call_count == 1 # Commit post drops/creates
+    mock_conn.rollback.assert_called_once() # Se intentó rollback
+    
+    captured = capsys.readouterr()
+    # El mensaje impreso será el del error original de insert_test_data
+    assert f"Error al crear tablas: {error_in_insert}" in captured.out
+    
+    mock_conn.close.assert_called_once() # El finally debe intentar cerrar
