@@ -10,13 +10,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__)) # Corrected __file__
 parent_dir = os.path.join(current_dir, '..')
 sys.path.insert(0, parent_dir)
 
-# Now import from the 'app' module directly
-# Ensure app.py has been loaded into sys.modules as 'app'
-# We need to import the specific error types from app.py if app.py imports them
-# or from psycopg2 directly if the tests use them. Let's import them from psycopg2.
 from app import app, DB_CONFIG as DEFAULT_DB_CONFIG, get_db_connection
-# Assuming app.py has LISTAR_FACTURAS_ENDPOINT_ACTIVE defined
-# from app import LISTAR_FACTURAS_ENDPOINT_ACTIVE # We'll mock this directly
 
 # --- Fixtures de Pytest ---
 @pytest.fixture

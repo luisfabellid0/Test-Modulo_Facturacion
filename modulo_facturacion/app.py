@@ -9,7 +9,7 @@ DB_CONFIG = {
     'host': 'localhost',
     'database': 'facturacion_db',
     'user': 'postgres',
-    'password': 'alumno'
+    'password': 'root'
 }
 
 def get_db_connection():
