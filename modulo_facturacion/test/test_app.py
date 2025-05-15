@@ -3121,6 +3121,381 @@ def test_csrf_protection_missing(client, mock_db_connection):
     # En una aplicación segura, esto debería fallar sin CSRF token
     # Pero como no hay protección, debería pasar (esto es malo)
     assert response.status_code in [302, 200]  # Esto muestra la vulnerabilidad
+def test_agregar_cliente_post_nombre_con_espacios_extremos(client, mock_db_connection):
+    """Test: agregar_cliente con nombre con espacios al inicio/final. ¿Se normaliza o guarda tal cual?"""
+    mock_cursor = mock_db_connection["cursor"]
+    nombre_con_espacios = "  Cliente con Espacios  "
+    nombre_esperado_db = nombre_con_espacios.strip() # Asumiendo que la app hace strip()
+
+    form_data = {'nombre': nombre_con_espacios, 'direccion': 'Dir', 'telefono': '123', 'email': 'espacios@b.com'}
+    client.post('/agregar_cliente', data=form_data)
+
+    mock_cursor.execute.assert_called_once_with(
+        "INSERT INTO clientes (nombre, direccion, telefono, email) VALUES (%s, %s, %s, %s);",
+        (nombre_esperado_db, 'Dir', '123', 'espacios@b.com')
+    )
+    mock_db_connection["conn"].commit.assert_called_once()
+
+def test_nueva_factura_post_items_con_mismo_producto_id(client, mock_db_connection):
+    """Test: nueva_factura con dos líneas de item para el mismo producto_id."""
+    mock_cursor = mock_db_connection["cursor"]
+    # Precio, Secuencia, Factura ID
+    mock_cursor.fetchone.side_effect = [(10.00,), (10.00,), (132,), (461,)] 
+    # La app podría sumar cantidades o tratar como líneas separadas. Asumimos líneas separadas.
+    # Total esperado: (1 * 10) + (2 * 10) = 30
+
+    form_data = {
+        'cliente_id': '101',
+        'producto_id_1': '1', 'cantidad_1': '1', # Producto 1, cantidad 1
+        'producto_id_2': '1', 'cantidad_2': '2', # Mismo Producto 1, cantidad 2
+    }
+    response = client.post('/factura/nueva', data=form_data)
+    assert response.status_code == 302
+    assert response.location == '/factura/461'
+
+    # Verificar inserción de factura con total correcto (asumiendo 30.00)
+    # Verificar inserciones de items (dos llamadas a INSERT factura_items)
+    calls = mock_cursor.execute.call_args_list
+    insert_factura_call = mock.call(
+        'INSERT INTO facturas (numero, cliente_id, total) VALUES (%s, %s, %s) RETURNING id;',
+        ('FACT-132', '101', decimal.Decimal('30.00')) # O float(30.00) según la app
+    )
+    insert_item1_call = mock.call(
+        'INSERT INTO factura_items (factura_id, producto_id, cantidad, precio, subtotal) VALUES (%s, %s, %s, %s, %s);',
+        (461, '1', '1', decimal.Decimal('10.00'), decimal.Decimal('10.00'))
+    )
+    insert_item2_call = mock.call(
+        'INSERT INTO factura_items (factura_id, producto_id, cantidad, precio, subtotal) VALUES (%s, %s, %s, %s, %s);',
+        (461, '1', '2', decimal.Decimal('10.00'), decimal.Decimal('20.00'))
+    )
+    assert insert_factura_call in calls
+    assert insert_item1_call in calls
+    assert insert_item2_call in calls
+    mock_db_connection["conn"].commit.assert_called_once()
+
+
+def test_agregar_producto_post_descripcion_muy_larga(client, mock_db_connection):
+    """Test: agregar_producto con descripción extremadamente larga."""
+    mock_cursor = mock_db_connection["cursor"]
+    descripcion_larga = "Descripción " * 1000 # 12000 caracteres
+    # Asumir que la BD la trunca o da error si excede el límite de la columna.
+    mock_cursor.execute.side_effect = psycopg2_errors.StringDataRightTruncation("descripción demasiado larga")
+
+    form_data = {'nombre': 'Prod Largo', 'descripcion': descripcion_larga, 'precio': '10'}
+    response = client.post('/productos/agregar', data=form_data)
+    assert response.status_code == 500
+    json_data = response.get_json()
+    assert "descripción demasiado larga" in json_data['details']
+
+def test_nueva_factura_post_cantidad_muy_grande_calculo_subtotal(client, mock_db_connection):
+    """Test: nueva_factura con cantidad muy grande, verificar posible overflow en cálculo o BD."""
+    mock_cursor = mock_db_connection["cursor"]
+    # Precio, Secuencia, Factura ID
+    mock_cursor.fetchone.side_effect = [(decimal.Decimal('1.00'),), (133,), (462,)]
+    cantidad_grande_str = "1000000000000.50" # Un número grande
+    # Asumir que el subtotal (precio * cantidad) excede el límite de Numeric en BD para subtotal.
+    def execute_side_effect(query, params=None):
+        if "INSERT INTO factura_items" in query:
+            # params[4] es subtotal
+            if params[4] > decimal.Decimal('1E12'): # Simular un límite
+                 raise psycopg2_errors.NumericValueOutOfRange("subtotal del item fuera de rango")
+        return None
+    
+    original_execute = mock_cursor.execute
+    def side_effect_router(query, params=None):
+        if "INSERT INTO factura_items" in query and params[2] == cantidad_grande_str: # params[2] es cantidad
+            # subtotal = decimal.Decimal(params[2]) * params[3] # cantidad * precio
+            # if subtotal > decimal.Decimal('1E12'):
+            raise psycopg2_errors.NumericValueOutOfRange("subtotal del item fuera de rango")
+        return original_execute(query, params)
+    mock_cursor.execute.side_effect = side_effect_router
+
+
+    form_data = {'cliente_id': '101', 'producto_id_1': '1', 'cantidad_1': cantidad_grande_str}
+    response = client.post('/factura/nueva', data=form_data)
+    assert response.status_code == 500
+    json_data = response.get_json()
+    assert "subtotal del item fuera de rango" in json_data['details']
+
+def test_agregar_cliente_post_fecha_registro_formato_invalido(client, mock_db_connection):
+    """Test: agregar_cliente con un campo de fecha hipotético en formato inválido."""
+    # Asumir que `clientes` tiene una columna `fecha_registro DATE` y el form la envía.
+    mock_cursor = mock_db_connection["cursor"]
+    mock_cursor.execute.side_effect = psycopg2_errors.InvalidDatetimeFormat("formato de fecha inválido: '30/02/2025'")
+    form_data = {
+        'nombre': 'Cliente Fecha', 'direccion': 'Dir', 'telefono': '123', 
+        'email': 'fecha@b.com', 'fecha_registro': '30/02/2025' # Fecha inválida
+    }
+    # Asumir que la app intenta insertar esta fecha directamente.
+    response = client.post('/agregar_cliente', data=form_data)
+    assert response.status_code == 500
+    json_data = response.get_json()
+    assert "formato de fecha inválido" in json_data['details']
+
+# Tests de HTTP y Detalles de Petición/Respuesta
+def test_agregar_cliente_post_unexpected_content_type(client, mock_db_connection):
+    """Test: POST a /agregar_cliente con Content-Type application/json."""
+    # request.form estará vacío. La app debería manejar esto como campos faltantes.
+    response = client.post('/agregar_cliente', 
+                           data=json.dumps({'nombre': 'Test JSON'}), 
+                           content_type='application/json')
+    assert response.status_code == 200 # Asume que vuelve al form con error
+    assert b"Todos los campos son obligatorios." in response.data
+    mock_db_connection["get_db_connection"].assert_not_called()
+
+def test_json_error_response_content_type(client, mock_db_connection):
+    """Test: Errores de BD que devuelven JSON tienen Content-Type application/json."""
+    mock_db_connection["get_db_connection"].side_effect = psycopg2.OperationalError("Error DB for JSON test")
+    response = client.get('/facturas/') # Ruta que devuelve JSON en error de BD
+    assert response.status_code == 500
+    assert response.content_type == 'application/json'
+
+def test_html_success_response_content_type(client, mock_db_connection):
+    """Test: Rutas HTML exitosas tienen Content-Type text/html; charset=utf-8."""
+    mock_cursor = mock_db_connection["cursor"]
+    mock_cursor.fetchall.return_value = [] # No data, pero la página se renderiza
+    response = client.get('/facturas/')
+    assert response.status_code == 200
+    assert response.content_type == 'text/html; charset=utf-8'
+
+# Tests de Interacción con BD y Transacciones
+# No es fácil simular fallo de `psycopg2.connect` después de retries sin modificar `get_db_connection`.
+# El mock actual de `get_db_connection` ya cubre el fallo de conexión inicial.
+
+def test_listar_facturas_fetchall_returns_malformed_row(client, mock_db_connection):
+    """Test: listar_facturas donde fetchall() retorna una fila con datos malformados."""
+    mock_cursor = mock_db_connection["cursor"]
+    # Fila[0] debería ser int (id), Fila[4] debería ser numérico (total)
+    # Si la plantilla espera desempaquetar o formatear estos tipos y son incorrectos, puede fallar.
+    malformed_row = ("id_string_malo", "FACT-ERR", "2023-01-01", "Cliente Err", "total_string_malo")
+    mock_cursor.fetchall.return_value = [malformed_row]
+    
+    response = client.get('/facturas/')
+    # La plantilla podría fallar al renderizar 'total_string_malo' como moneda o 'id_string_malo' en un enlace.
+    # Esto resultaría en un 500 Internal Server Error si no se maneja en la plantilla con `default` o similar.
+    assert response.status_code == 500 
+    # El error exacto es difícil de predecir (TemplateAssertionError, TypeError, etc.)
+    # Verificar que al menos no es un 200 OK. Podríamos buscar un mensaje genérico de error de Flask.
+    assert b"Internal Server Error" in response.data # Si es la página de error por defecto de Flask.
+
+
+def test_nueva_factura_post_check_constraint_violation(client, mock_db_connection):
+    """Test: nueva_factura con violación de un CHECK constraint (ej: tipo_factura inválido)."""
+    # Asumir que `facturas` tiene `tipo_factura CHAR(1) CHECK (tipo_factura IN ('A', 'B', 'C'))`
+    mock_cursor = mock_db_connection["cursor"]
+    mock_cursor.fetchone.side_effect = [(10.00,), (134,)] # Precio, Secuencia
+    def execute_side_effect(query, params=None):
+        if "INSERT INTO facturas" in query:
+            # Asumir que los params incluyen un tipo_factura 'X' inválido
+            raise psycopg2_errors.CheckViolation("violación de check constraint 'chk_tipo_factura'")
+        return None
+    
+    original_execute = mock_cursor.execute
+    def side_effect_router(query, params=None):
+        # Suponiendo que el INSERT incluye un campo para tipo_factura y se le pasa 'X'
+        if "INSERT INTO facturas" in query: # y params contiene tipo_factura='X'
+            raise psycopg2_errors.CheckViolation("violación de check constraint 'chk_tipo_factura'")
+        return original_execute(query, params)
+    mock_cursor.execute.side_effect = side_effect_router
+
+    form_data = {
+        'cliente_id': '101', 'producto_id_1': '1', 'cantidad_1': '1',
+        'tipo_factura': 'X' # Dato hipotético que viola un CHECK
+    }
+    response = client.post('/factura/nueva', data=form_data)
+    assert response.status_code == 500
+    json_data = response.get_json()
+    assert "violación de check constraint" in json_data['details']
+
+def test_nueva_factura_post_datetime_field_overflow(client, mock_db_connection):
+    """Test: nueva_factura con fecha que causa DatetimeFieldOverflow."""
+    # Asumir que el form envía un campo 'fecha_emision_factura'
+    mock_cursor = mock_db_connection["cursor"]
+    mock_cursor.fetchone.side_effect = [(10.00,), (135,)] # Precio, Secuencia
+    def execute_side_effect(query, params=None):
+        if "INSERT INTO facturas" in query: # y params contiene la fecha 0000-01-01
+            raise psycopg2_errors.DatetimeFieldOverflow("fecha fuera de rango para tipo timestamp")
+        return None
+    
+    original_execute = mock_cursor.execute
+    def side_effect_router(query, params=None):
+        if "INSERT INTO facturas" in query: # y params contiene la fecha problemática
+            raise psycopg2_errors.DatetimeFieldOverflow("fecha fuera de rango para tipo timestamp")
+        return original_execute(query, params)
+    mock_cursor.execute.side_effect = side_effect_router
+
+    form_data = {
+        'cliente_id': '101', 'producto_id_1': '1', 'cantidad_1': '1',
+        'fecha_emision_factura': '0000-01-01' # Fecha problemática
+    }
+    response = client.post('/factura/nueva', data=form_data)
+    assert response.status_code == 500
+    json_data = response.get_json()
+    assert "fecha fuera de rango" in json_data['details']
+
+# Tests de Lógica de Aplicación y Estado
+def test_ver_factura_marcada_como_cancelada(client, mock_db_connection):
+    """Test: ver_factura para una factura que tiene un estado 'CANCELADA'."""
+    # Asumir que `facturas` tiene un campo `estado` y la plantilla lo muestra.
+    mock_cursor = mock_db_connection["cursor"]
+    # id, numero, fecha, total, cliente_id, cliente_nombre, ..., estado (nuevo campo)
+    factura_cancelada_data = (1, 'F-CANC', '2023-03-01', 50.0, 3, 'Cliente C', 'Dir C', 'Tel C', 'CANCELADA')
+    mock_cursor.fetchone.return_value = factura_cancelada_data
+    mock_cursor.fetchall.return_value = [] # Sin items para simplificar
+
+    response = client.get('/factura/1')
+    assert response.status_code == 200
+    assert b"F-CANC" in response.data
+    assert b"Estado: CANCELADA" in response.data # Mensaje esperado en la plantilla
+
+def test_editar_cliente_get_xss_prevention_in_form_values(client, mock_db_connection):
+    """Test: editar_cliente, los datos con HTML especial se escapan en los values del form."""
+    mock_cursor = mock_db_connection["cursor"]
+    xss_nombre = "<script>alert('XSS')</script>"
+    # id, nombre, direccion, telefono, email
+    cliente_con_xss = (1, xss_nombre, "Dir", "Tel", "xss@example.com")
+    mock_cursor.fetchone.return_value = cliente_con_xss
+
+    response = client.get('/clientes/1/editar')
+    assert response.status_code == 200
+    # Verificar que el script NO está tal cual en el value, sino escapado.
+    # Flask/Jinja2 escapan por defecto en {{ ... }}.
+    # En <input value="{{ cliente.nombre }}">, se escaparía.
+    escaped_xss_nombre = "&lt;script&gt;alert(&#39;XSS&#39;)&lt;/script&gt;"
+    assert bytes(escaped_xss_nombre, 'utf-8') in response.data
+    assert b"<script>alert('XSS')</script>" not in response.data # No debe estar el script crudo
+
+
+def test_editar_producto_post_precio_cero(client, mock_db_connection):
+    """Test: editar_producto actualizando el precio a 0.00. ¿Es permitido?"""
+    mock_cursor = mock_db_connection["cursor"]
+    form_data = {'nombre': 'Prod Gratis', 'descripcion': 'Desc', 'precio': '0.00'}
+
+    response = client.post('/productos/editar/1', data=form_data)
+    assert response.status_code == 302 # Asumiendo que es una actualización válida
+    assert response.location == '/productos'
+    mock_cursor.execute.assert_called_once_with(
+        'UPDATE productos SET nombre = %s, descripcion = %s, precio = %s WHERE id = %s;',
+        ('Prod Gratis', 'Desc', '0.00', 1)
+    )
+    mock_db_connection["conn"].commit.assert_called_once()
+
+# Tests de Configuración y Logging de Flask
+def test_get_db_connection_failure_finally_block_error_masking(client, mock_db_connection):
+    """Test: Falla get_db_connection, y un hipotético finally en la vista también falla."""
+    # Este test es complejo porque requiere controlar el flujo dentro de la vista.
+    # Supongamos que una vista hace:
+    # conn = None
+    # try:
+    #   conn = get_db_connection() # Falla aquí
+    #   # ...
+    # finally:
+    #   if conn: conn.close() # No se ejecuta conn.close()
+    #   raise ValueError("Error en finally") # Este error podría enmascarar el original
+    
+    # Si get_db_connection falla, la vista lo captura y devuelve 500.
+    # Si el *manejador de error* de la vista tiene un finally que falla, es diferente.
+    # Por simplicidad, nos enfocamos en que el error original de get_db_connection se reporte.
+    mock_db_connection["get_db_connection"].side_effect = psycopg2.OperationalError("Fallo inicial de conexión")
+    
+    response = client.get('/facturas/') # Ruta que usa get_db_connection
+    assert response.status_code == 500
+    json_data = response.get_json()
+    assert "Fallo inicial de conexión" in json_data['details'] # El error original debe prevalecer
+
+@mock.patch('app.logger') # Asumir que el logger de la app es 'app.logger'
+def test_app_logs_critical_on_db_connection_failure(mock_app_logger, client, mock_db_connection):
+    """Test: app.logger.critical (o error) es llamado en fallo de conexión a BD."""
+    error_message = "Simulated DB connection failure for logging"
+    mock_db_connection["get_db_connection"].side_effect = psycopg2.OperationalError(error_message)
+
+    client.get('/facturas/') # Intentar acceder a una ruta que usa la BD
+
+    # Verificar que se llamó a un método de logging de error/crítico
+    # El método exacto (error, critical, exception) depende de la implementación en app.py
+    called_critical = mock_app_logger.critical.called
+    called_error = mock_app_logger.error.called
+    called_exception = mock_app_logger.exception.called
+    assert called_critical or called_error or called_exception # Al menos uno fue llamado
+
+    # Opcionalmente, verificar el mensaje si es predecible
+    if called_critical:
+        mock_app_logger.critical.assert_any_call(mock.ANY, exc_info=mock.ANY) # O con el mensaje específico
+    elif called_error:
+        mock_app_logger.error.assert_any_call(mock.ANY, exc_info=mock.ANY)
+    elif called_exception:
+        mock_app_logger.exception.assert_any_call(mock.ANY)
+
+
+def test_db_config_attribute_error_on_nested_access(mock_db_connection):
+    """Test: AttributeError en get_db_connection si accede a DB_CONFIG incorrectamente."""
+    # get_db_connection(config={'host': {'sub_host': 'val'}}) si espera config['host'] como string.
+    custom_config = {'host': {'sub_host_val': 'value'}, 'database': 'db', 'user': 'u', 'password': 'p'}
+    
+    with mock.patch('app.psycopg2.connect') as mock_actual_connect:
+        # Si get_db_connection hiciera algo como config['host'].lower(), fallaría con AttributeError
+        # Esto depende de la implementación exacta de get_db_connection.
+        # Psycopg2.connect espera strings, por lo que si se le pasa un dict para 'host', fallará.
+        mock_actual_connect.side_effect = TypeError("host parameter must be a string")
+        
+        mock_db_connection['get_db_connection'].stop() # Detener mock global
+        with pytest.raises(TypeError, match="host parameter must be a string"):
+            get_db_connection(config=custom_config)
+        mock_db_connection['get_db_connection'].start() # Restaurar
+
+
+def test_nueva_factura_post_total_precision_con_decimal(client, mock_db_connection):
+    """Test: nueva_factura con precios/cantidades Decimal para asegurar precisión en total."""
+    mock_cursor = mock_db_connection["cursor"]
+    # Precios y cantidades como Decimal
+    precio1 = decimal.Decimal('10.01')
+    cantidad1 = decimal.Decimal('2.5')
+    subtotal1 = precio1 * cantidad1 # 25.025
+
+    precio2 = decimal.Decimal('0.02')
+    cantidad2 = decimal.Decimal('1.5')
+    subtotal2 = precio2 * cantidad2 # 0.030
+
+    total_factura_esperado = subtotal1 + subtotal2 # 25.055
+    # La BD podría redondear a 2 decimales (ej: 25.06 o 25.05). Asumamos que se guarda con más precisión o como la app calcule.
+
+    mock_cursor.fetchone.side_effect = [
+        (precio1,), (precio2,), # Precios
+        (136,), (463,) # Secuencia, Factura ID
+    ]
+    
+    form_data = {
+        'cliente_id': '102',
+        'producto_id_1': '10', 'cantidad_1': str(cantidad1),
+        'producto_id_2': '11', 'cantidad_2': str(cantidad2),
+    }
+    response = client.post('/factura/nueva', data=form_data)
+    assert response.status_code == 302
+    
+    # Verificar que el total en la BD es el esperado, considerando la precisión de Decimal
+    # Esto depende de cómo la app maneje y guarde los Decimal.
+    # El mock.call debe usar el mismo tipo (Decimal o float) que la app usa para la BD.
+    # Si la app convierte a float para la BD, puede haber pérdida de precisión.
+    # Si usa Decimal (o la BD es NUMERIC), la precisión se mantiene.
+    mock_cursor.execute.assert_any_call(
+        'INSERT INTO facturas (numero, cliente_id, total) VALUES (%s, %s, %s) RETURNING id;',
+        ('FACT-136', '102', total_factura_esperado) # El tipo de total_factura_esperado debe coincidir con el de la app
+    )
+
+
+def test_ver_factura_fecha_formato_regional_en_template(client, mock_db_connection):
+    """Test: ver_factura muestra la fecha en un formato regional esperado (si aplica)."""
+    # Asumir que la app o la plantilla formatea la fecha. Ej: DD/MM/YYYY
+    mock_cursor = mock_db_connection["cursor"]
+    # Fecha en formato ISO desde la BD
+    mock_cursor.fetchone.return_value = (1, 'F-FECHA', '2023-12-25', 10.0, 1, 'Navidad', 'Polo Norte', '0', 'ACTIVA')
+    mock_cursor.fetchall.return_value = [] # No items
+
+    response = client.get('/factura/1')
+    assert response.status_code == 200
+    # Verificar el formato de fecha esperado en la plantilla.
+    # Esto es frágil si el formato cambia.
+    assert b"Fecha: 25/12/2023" in response.data # Ejemplo de formato esperado
 # Add DB error test for eliminar_producto (other errors)
 # ... (omitted)
 
